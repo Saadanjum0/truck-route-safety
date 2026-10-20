@@ -86,23 +86,29 @@ def _is_distinct(candidate, routes):
 
 def get_routes(origin, dest):
     """Up to 3 distinct routes: OSRM's own alternatives, topped up with via-point detours
-    either side of the straight line when OSRM returns fewer."""
+    either side of the straight line when OSRM returns fewer. All detours are tried
+    and the fastest distinct ones win, so a via point that snaps onto a slow back road loses."""
     routes = _osrm([origin, dest], alternatives=True)[:3]
+    if len(routes) >= 3:
+        return routes
     mid_lat, mid_lon = (origin["lat"] + dest["lat"]) / 2, (origin["lon"] + dest["lon"]) / 2
     # Perpendicular to origin->dest in a locally flat (lon scaled by cos lat) frame.
     k = math.cos(math.radians(mid_lat))
     dx, dy = (dest["lon"] - origin["lon"]) * k, dest["lat"] - origin["lat"]
-    for frac in (0.12, -0.12, 0.25, -0.25, 0.4, -0.4):
-        if len(routes) >= 3:
-            break
-        via = {"lat": mid_lat + dx * frac, "lon": mid_lon - dy * frac / k}
+    vias = [{"lat": mid_lat + dx * f, "lon": mid_lon - dy * f / k} for f in (0.12, -0.12, 0.25, -0.25, 0.4, -0.4)]
+
+    def via_route(via):
         try:
-            candidate = _osrm([origin, via, dest])[0]
+            return _osrm([origin, via, dest])[0]
         except UpstreamError:
-            continue  # via point not routable (sea, border...), try the next one
-        # ponytail: fixed 1.5x detour cap, tune if trucks need wider alternatives
-        if candidate["duration_s"] < 1.5 * routes[0]["duration_s"] and _is_distinct(candidate, routes):
-            routes.append(candidate)
+            return None  # via point not routable (sea, border...)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        candidates = [c for c in pool.map(via_route, vias) if c]
+    for c in sorted(candidates, key=lambda c: c["duration_s"]):
+        # ponytail: fixed 2x detour cap, tune if trucks need wider alternatives
+        if len(routes) < 3 and c["duration_s"] < 2 * routes[0]["duration_s"] and _is_distinct(c, routes):
+            routes.append(c)
     return routes
 
 
